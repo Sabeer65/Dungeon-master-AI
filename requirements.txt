@@ -1,0 +1,2 @@
+streamlit==1.53.0
+langchain-ollama==1.0.1
