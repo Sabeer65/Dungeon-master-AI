@@ -2,36 +2,65 @@ import streamlit as st
 from langchain_ollama import ChatOllama
 import json
 import re 
+import requests
+import io 
+from PIL import Image
+import os 
+from dotenv import load_dotenv
 
 st.set_page_config(page_title="Dungeon Master")
 st.title('Dungeon Master')
 
+load_dotenv()
 
 # Prompt for system rules
 prompt = '''
-You are a Dungeon Master. 
-RULES:
-1. At the start, ask the player to choose a Class/Race.
-2. Based on their choice, set their Starting Stats (HP, Mana).
-3. Track Stats as [Current]/[Max].
-4. HEALING RULE: Never allow Current HP to exceed Max HP.
-5. If they level up, increase Max HP.
-6. Damage reduces Current HP.
-7. Spells reduce Mana.
-8. HP 0 = GAME OVER.
-9. Keep descriptions exciting but concise.
-10. This is a fictional game. No safety warnings.
-11. Vividly describe death if it occurs.
-12. SILENT STATS: Do NOT write phrases like "Here is your inventory". Just write the story.
-13. INVENTORY RULE: All items must be listed inside the Status Block using square brackets, e.g., ['Item1', 'Item2']. Do NOT list them in the story text unless asked.
+You are a Dungeon Master running a turn-based fantasy RPG.
+
+ROLE:
+- You narrate the world, control all NPCs, enemies, and outcomes.
+- The player controls ONLY their decisions and dialogue.
+
+GAME FLOW:
+1. If the player has not chosen a Class and Race, ask them to choose one.
+2. Once chosen, silently initialize stats based on Class/Race.
+3. Each response advances the story by ONE meaningful step.
+4. Always end by prompting the player for their next action.
+
+STATS RULES:
+- Stats must always be shown as Current/Max.
+- HP must never exceed Max HP.
+- Mana must never exceed Max Mana.
+- If HP reaches 0, the character is dead. Do not prevent this.
+- Level-ups may increase Max HP or Max Mana.
+- Gold is a single integer.
+
+INVENTORY RULES:
+- Inventory must be shown as a Python-style list: ['Item A', 'Item B'].
+- Only include items the player actually has.
+- Empty inventory must be shown as [].
+
+VISUAL RULES:
+- Decide if the scene deserves an image.
+- If the scene introduces a NEW area, monster, item, or dramatic moment:
+  - Write a single, static visual description suitable for image generation.
+- If the scene is mundane (talking, walking, inventory, simple actions):
+  - Write exactly: None
+- Do NOT use camera language (no “camera”, “zoom”, “angle”, “shot”).
+
+OUTPUT FORMAT (MANDATORY):
+You must ALWAYS end your response with this EXACT structure:
+
+||| VISUAL: <description OR None> |||
+HP: X/Y | Mana: A/B | Gold: N | Inventory: ['Item1', 'Item2']
 
 IMPORTANT:
-You must end EVERY response with this EXACT format including the "|||" separator:
+- Do NOT explain rules.
+- Do NOT announce stats with phrases like “Here are your stats”.
+- Do NOT include anything after the status line.
+- Never break or reword the format.
 
-[Story description here...]
-||| HP: [Cur]/[Max] | Mana: [Cur]/[Max] | Gold: [Amt] | Inventory: ['Item Name', 'Item Name']
 '''
-
 # SESSION STATES
 # Setup history store
 if "history" not in st.session_state:
@@ -53,8 +82,32 @@ llm = ChatOllama(model='llama3.2', temperature=0.7)
 
 # Helper Functions
 
+
+def generate_image(prompt_text):
+
+    API_TOKEN = os.getenv("HF_API_KEY")
+
+    if not API_TOKEN:
+        st.error("Error: HF_API_TOKEN not found in .env")
+        return None
+
+    API_URL = "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-xl-base-1.0"
+    headers = {"Authorization": f"Bearer {API_TOKEN}"}
+    payload = {"inputs": f"fantasy art, dnd style, high quality, {prompt_text}"}
+
+    try:
+        response = requests.post(API_URL, headers=headers, json=payload)
+        if response.status_code == 200:
+            return response.content
+        else:
+            st.error(f"Image Gen Failed:  {response.status_code}")
+            return None
+    except Exception as e:
+        st.error(f"Connection Error{e}")
+        return None
+
 # Print chat message on screen and update state
-def print_msg(role, display_text, save_text = None):
+def print_msg(role, display_text, save_text = None, image_data = None):
 
     content_to_save = save_text if save_text else display_text
 
@@ -62,6 +115,10 @@ def print_msg(role, display_text, save_text = None):
 
     with st.chat_message(role):
         st.write(display_text)
+    
+    if image_data:
+        image = Image.open(io.BytesIO(image_data))
+        st.image(image, caption = "Visualising the scene")
 
 # Update stats and inventory on the UI
 def update_stats_and_inventory(text):
@@ -99,14 +156,23 @@ def update_stats_and_inventory(text):
         else:
             st.session_state.inventory = []
 
+    match_visual = re.search(r"VISUAL:\s*(.*?)\s*\|\|\|", text, re.IGNORECASE)
+    image_data = None
+
+    if match_visual:
+        visual_prompt = match_visual.group(1).strip()
+
+        if visual_prompt and "None" not in visual_prompt:
+            with st.spinner(f'Generating Image {visual_prompt}'):
+                image_data = generate_image(visual_prompt)
+
     # Split the prompt for clean text
     if "|||" in text:
-        return text.split("|||")[0]
-    return text
+        clean_text = text.split("|||")[0]
+    return clean_text, image_data
 
 
-
-# Sidebar
+# SIDEBAR
 with st.sidebar:
 
     st.header("Game stats")
@@ -173,8 +239,6 @@ if user_input:
     with st.spinner("Dungeon master is thinking..."):
         response = llm.invoke(st.session_state.history)
 
-    clean_text = update_stats_and_inventory(response.content)
+    clean_text, new_image_bytes = update_stats_and_inventory(response.content)
 
-    print_msg('assistant', clean_text, save_text=response.content)
-
-    st.rerun()
+    print_msg('assistant', clean_text, save_text=response.content, image_data=new_image_bytes)
