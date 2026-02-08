@@ -1,7 +1,6 @@
 import streamlit as st
 from langchain_ollama import ChatOllama
 import json
-import re 
 import requests
 import io 
 from PIL import Image
@@ -15,51 +14,47 @@ load_dotenv()
 
 # Prompt for system rules
 prompt = '''
-You are a Dungeon Master running a turn-based fantasy RPG.
+You are a Dungeon Master running an immersive, narrative-driven fantasy RPG.
 
 ROLE:
-- You narrate the world, control all NPCs, enemies, and outcomes.
-- The player controls ONLY their decisions and dialogue.
+- You are a STORYTELLER, not a game engine. 
+- Do NOT output dice rolls, math calculations, or phrases like "Rolling for initiative" or "Skill check passed".
+- Decide outcomes based on the player's class, stats, and logical narrative consequences.
 
 GAME FLOW:
-1. If the player has not chosen a Class and Race, ask them to choose one.
-2. Once chosen, silently initialize stats based on Class/Race.
-3. Each response advances the story by ONE meaningful step.
-4. Always end by prompting the player for their next action.
+1. NARRATIVE FIRST: Write the story description.
+   - Be descriptive, atmospheric, and engaging.
+   - Describe combat viscerally (e.g., "The goblin's blade grazes your ribs," not "You take 5 damage").
+   - If the player chose a Class/Race, customize the narration (e.g., Orcs are strong, Wizards are wise).
+   
+2. SEPARATOR: You MUST end the story with exactly this separator: ***JSON***
 
-STATS RULES:
-- Stats must always be shown as Current/Max.
-- HP must never exceed Max HP.
-- Mana must never exceed Max Mana.
-- If HP reaches 0, the character is dead. Do not prevent this.
-- Level-ups may increase Max HP or Max Mana.
-- Gold is a single integer.
+3. DATA: Immediately after the separator, output a SINGLE line of valid JSON.
 
-INVENTORY RULES:
-- Inventory must be shown as a Python-style list: ['Item A', 'Item B'].
-- Only include items the player actually has.
-- Empty inventory must be shown as [].
+DATA RULES (CRITICAL):
+- **Damage/Healing:** Update the JSON stats to match the story. If you wrote that the player was hit, lower the HP in the JSON.
+- **Visuals:** Provide a prompt for an image generator. Use "null" for mundane scenes.
 
-VISUAL RULES:
-- Decide if the scene deserves an image.
-- If the scene introduces a NEW area, monster, item, or dramatic moment:
-  - Write a single, static visual description suitable for image generation.
-- If the scene is mundane (talking, walking, inventory, simple actions):
-  - Write exactly: None
-- Do NOT use camera language (no “camera”, “zoom”, “angle”, “shot”).
+JSON STRUCTURE:
+{
+    "stats": {
+        "hp": "Current/Max",
+        "mana": "Current/Max",
+        "gold": 0
+    },
+    "inventory": ["Item Name", "Item Name"],
+    "visual": "Description of the CURRENT scene for an image generator (or null)"
+}
 
-OUTPUT FORMAT (MANDATORY):
-You must ALWAYS end your response with this EXACT structure:
-
-||| VISUAL: <description OR None> |||
-HP: X/Y | Mana: A/B | Gold: N | Inventory: ['Item1', 'Item2']
+Example Turn:
+User: I attack the wolf.
+AI: You lunge forward, driving your steel into the beast's flank. It yelps and snaps at you, tearing into your leather armor with jagged teeth. Pain flares in your shoulder.
+***JSON***
+{"stats": {"hp": "25/30", "mana": "5/5", "gold": 10}, "inventory": ["Longsword"], "visual": "A wolf snapping at a warrior in a forest"}
 
 IMPORTANT:
-- Do NOT explain rules.
-- Do NOT announce stats with phrases like “Here are your stats”.
-- Do NOT include anything after the status line.
-- Never break or reword the format.
-
+* Write the json block everytime without fail
+* Do not stop generating until json is completed.
 '''
 # SESSION STATES
 # Setup history store
@@ -77,8 +72,12 @@ if "stats" not in st.session_state:
 if "inventory" not in st.session_state:
     st.session_state.inventory = []
 
+# Setup Image Store
+if 'current_image' not in st.session_state:
+    st.session_state.current_image = None
+
 # Initialise Model
-llm = ChatOllama(model='llama3.2', temperature=0.7)
+llm = ChatOllama(model='llama3.2', temperature=0.5)
 
 # Helper Functions
 
@@ -91,89 +90,97 @@ def generate_image(prompt_text):
         st.error("Error: HF_API_TOKEN not found in .env")
         return None
 
-    API_URL = "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-xl-base-1.0"
+    API_URL = "https://router.huggingface.co/hf-inference/models/stabilityai/stable-diffusion-xl-base-1.0"
     headers = {"Authorization": f"Bearer {API_TOKEN}"}
     payload = {"inputs": f"fantasy art, dnd style, high quality, {prompt_text}"}
 
     try:
+        print(f"Generating image for: {prompt_text}") # DEBUG LINE
         response = requests.post(API_URL, headers=headers, json=payload)
+        
         if response.status_code == 200:
+            print("Image generated successfully!") # DEBUG LINE
             return response.content
         else:
-            st.error(f"Image Gen Failed:  {response.status_code}")
+            # This prints the error to your terminal so you can read it
+            print(f"Error {response.status_code}: {response.text}") 
+            st.error(f"Image Gen Failed: {response.status_code}")
             return None
     except Exception as e:
-        st.error(f"Connection Error{e}")
+        print(f"Connection Error: {e}")
+        st.error(f"Connection Error: {e}")
         return None
 
-# Print chat message on screen and update state
-def print_msg(role, display_text, save_text = None, image_data = None):
+def stream_turn(llm, messages):
+    text_placeholder = st.empty()
+    full_response = ""
+    json_part = ""
+    story_part = ""
 
-    content_to_save = save_text if save_text else display_text
+    for chunk in llm.stream(messages):
+        full_response += chunk.content
 
-    st.session_state.history.append({'role':role, 'content':content_to_save})
+        print(chunk.content, end="", flush=True) # DEBUG LINE
 
-    with st.chat_message(role):
-        st.write(display_text)
-    
-    if image_data:
-        image = Image.open(io.BytesIO(image_data))
-        st.image(image, caption = "Visualising the scene")
-
-# Update stats and inventory on the UI
-def update_stats_and_inventory(text):
-    # Search for patterns
-    match_hp = re.search(r"HP:\s*(\d+)/(\d+)", text, re.IGNORECASE)
-    if match_hp:
-        current_hp = int(match_hp.group(1))
-        max_hp = int(match_hp.group(2))
-
-        final_current_hp = min(current_hp, max_hp)
-
-        st.session_state.stats['HP'] = f"{final_current_hp}/{max_hp}"
-        
-    match_mana = re.search(r"Mana:\s*(\d+)/(\d+)", text, re.IGNORECASE)
-    if match_mana:
-        current_mana = int(match_mana.group(1))
-        max_mana = int(match_mana.group(2))
-
-        final_current_mana = min(current_mana, max_mana)
-
-        st.session_state.stats['Mana'] = f"{final_current_mana}/{max_mana}"
-        st.session_state.stats['Mana'] = f"{final_current_mana}/{max_mana}"
-        
-    match_gold = re.search(r"Gold:\s*(\d+)", text, re.IGNORECASE)
-    if match_gold:
-        st.session_state.stats['Gold'] = match_gold.group(1)
-
-    match_inventory = re.search(r"Inventory:\s*\[(.*?)\]", text, re.IGNORECASE)
-    if match_inventory:
-        raw_string = match_inventory.group(1)
-
-        if raw_string.strip(): # Remove whitespaces and ',' split
-            new_items = [item.strip().replace("'", "").replace('"', "") for item in raw_string.split(',')]
-            st.session_state.inventory = new_items
+        if '***JSON***' in full_response:
+            parts = full_response.split('***JSON***') 
+            story_part = parts[0]
+            
+            if len(parts) > 1:
+                json_part = parts[1]
         else:
-            st.session_state.inventory = []
+            story_part = full_response
+    
+        text_placeholder.markdown(story_part + "▌")
+    
+    text_placeholder.markdown(story_part)
 
-    match_visual = re.search(r"VISUAL:\s*(.*?)\s*\|\|\|", text, re.IGNORECASE)
-    image_data = None
+    print("\n--- END OF TURN ---\n") # DEBUG LINE
 
-    if match_visual:
-        visual_prompt = match_visual.group(1).strip()
+    return story_part, json_part
 
-        if visual_prompt and "None" not in visual_prompt:
-            with st.spinner(f'Generating Image {visual_prompt}'):
-                image_data = generate_image(visual_prompt)
+def process_turn_data(json_str):
 
-    # Split the prompt for clean text
-    if "|||" in text:
-        clean_text = text.split("|||")[0]
-    return clean_text, image_data
+    try:
+        data = json.loads(json_str)
 
+        stats = data.get('stats', {})
+        inventory = data.get('inventory', [])
+        visual_prompt = data.get('visual', None)
+
+        new_hp = stats.get('hp')
+        new_mana = stats.get('mana')
+        new_gold = stats.get('gold')
+
+        if new_hp: st.session_state.stats['HP'] = new_hp
+        if new_mana: st.session_state.stats['Mana'] = new_mana
+        if new_gold is not None: st.session_state.stats['Gold'] = str(new_gold)
+
+        st.session_state.inventory = inventory
+
+        image_byte = None
+        if visual_prompt and visual_prompt != "null":
+            with st.spinner(f"Visualising: {visual_prompt}"):
+                image_byte = generate_image(visual_prompt)
+
+    except Exception as e:
+        st.warning(f'Dungeon master got distracted. Stats might not update this turn: {e}')
+        return None
+    
+    return image_byte
 
 # SIDEBAR
 with st.sidebar:
+
+    st.header("Visuals")
+
+    if st.session_state.current_image:
+        image = Image.open(io.BytesIO(st.session_state.current_image))
+        st.image(image, caption="Current Scene", use_container_width=True)
+    else:
+        st.info("No image generated yet")
+        
+    st.divider() 
 
     st.header("Game stats")
     c1,c2,c3 = st.columns(3)
@@ -221,8 +228,8 @@ for msg in st.session_state.history:
         continue
 
     display_text = msg['content']
-    if '|||' in display_text:
-        display_text = display_text.split('|||')[0] # split by ||| for clean text when re-rendering history 
+    if '***JSON***' in display_text:
+        display_text = display_text.split('***JSON***')[0] 
 
     with st.chat_message(msg['role']):
         st.write(display_text)
@@ -233,12 +240,23 @@ user_input = st.chat_input('What do you want to do?')
 
 if user_input:
 
-    print_msg('user', user_input)
+    st.session_state.history.append({'role':'user', 'content':user_input})
+    with st.chat_message('user'):
+        st.write(user_input)
 
     # AI response
-    with st.spinner("Dungeon master is thinking..."):
-        response = llm.invoke(st.session_state.history)
 
-    clean_text, new_image_bytes = update_stats_and_inventory(response.content)
+    story_text, json_str = stream_turn(llm, st.session_state.history)
 
-    print_msg('assistant', clean_text, save_text=response.content, image_data=new_image_bytes)
+    new_image = None
+
+    if json_str:
+        new_image = process_turn_data(json_str)
+    
+    if new_image:
+            st.session_state.current_image = new_image
+
+    full_log = story_text + '***JSON***' + json_str
+    st.session_state.history.append({'role':'assistant', 'content':full_log})
+
+    st.rerun()
